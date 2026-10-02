@@ -14,7 +14,7 @@ import { getNonce } from './util'
 const deepClone = rfdc()
 
 const REPO_MCMETA = 'https://raw.githubusercontent.com/misode/mcmeta'
-const VERSION = '1.19'
+const VERSION = '1.19.2'
 
 interface ViewType {
 	key: string
