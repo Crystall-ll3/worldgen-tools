@@ -81,7 +81,7 @@ function App() {
 		}
 		window.addEventListener('message', messageHandler)
 		return () => window.removeEventListener('message', messageHandler)
-	}, [setSampler])
+	}, [setSampler, viewConfig])
 
 	const ctx = useRef<CanvasRenderingContext2D>()
 	const imageData = useRef<ImageData>()

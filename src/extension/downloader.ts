@@ -2,13 +2,15 @@
  * Downloader from Spyglass
  * MIT License
  * Copyright (c) 2019-2022 SPGoding
+ * 
+ * Modified by Crystall-ll3
  */
 import { http, https } from 'follow-redirects'
 import { promises as fsp } from 'fs'
 import type { IncomingMessage } from 'http'
 import path from 'path'
 import type { Logger } from '../shared'
-import { bufferToString, fileUtil, isEnoent, promisifyAsyncIterable } from './fileUtil'
+import { fileUtil, isEnoent } from './fileUtil'
 
 type RemoteProtocol = 'http:' | 'https:'
 export type RemoteUriString = `${RemoteProtocol}${string}`
@@ -18,11 +20,6 @@ export namespace RemoteUriString {
 	}
 }
 
-export interface DownloaderDownloadOut {
-	cachePath?: string,
-	checksum?: string,
-}
-
 export class Downloader {
 	constructor(
 		private readonly cacheRoot: string,
@@ -30,107 +27,147 @@ export class Downloader {
 		private readonly lld = LowLevelDownloader.create(),
 	) { }
 
-	async download<R>(job: Job<R>, out: DownloaderDownloadOut = {}): Promise<R | undefined> {
-		const { id, cache, uri, options, transformer } = job
-		let checksum: string | undefined
-		let cachePath: string | undefined
-		let cacheChecksumPath: string | undefined
-		if (cache) {
-			const { checksumJob, checksumExtension } = cache
-			out.cachePath = cachePath = path.join(this.cacheRoot, id)
-			cacheChecksumPath = path.join(this.cacheRoot, id + checksumExtension)
-			try {
-				out.checksum = checksum = await this.download({ ...checksumJob, id: id + checksumExtension })
-				try {
-					const cacheChecksum = bufferToString(await fileUtil.readFile(fileUtil.pathToFileUri(cacheChecksumPath)))
-						.slice(0, -1) // Remove ending newline
-					if (checksum === cacheChecksum) {
-						try {
-							const cachedBuffer = await fileUtil.readFile(fileUtil.pathToFileUri(cachePath))
-							const deserializer = cache.deserializer ?? (b => b)
-							const ans = await transformer(await deserializer(cachedBuffer))
-							this.logger.info(`[Downloader] [${id}] Skipped downloading thanks to cache ${cacheChecksum}`)
-							return ans
-						} catch (e) {
-							this.logger.error(`[Downloader] [${id}] Loading cached file “${cachePath}”`, e)
-							if (isEnoent(e)) {
-								// Cache checksum exists, but cached file doesn't.
-								// Remove the invalid cache checksum.
-								try {
-									await fsp.unlink(cacheChecksumPath)
-								} catch (e) {
-									this.logger.error(`[Downloader] [${id}] Removing invalid cache checksum “${cacheChecksumPath}”`, e)
-								}
-							}
-						}
-					}
-				} catch (e) {
-					if (!isEnoent(e)) {
-						this.logger.error(`[Downloader] [${id}] Loading cache checksum “${cacheChecksumPath}”`, e)
-					}
-				}
-			} catch (e) {
-				this.logger.error(`[Downloader] [${id}] Fetching latest checksum “${checksumJob.uri}”`, e)
+	async getCacheOrRefreshDownload<R>(job: Job<R>, checksumJob: Job<string>): Promise<R | undefined> {
+		const { remoteUri, localFileUri, codec } = job
+		const { remoteUri: checksumRemoteUri, localFileUri: checksumLocalFileUri, codec: checksumCodec } = checksumJob
+
+		this.logger.info(`[Downloader] [${localFileUri}] Tring to check "${checksumRemoteUri}"`)
+
+		const remoteChecksum = await this.dowload(checksumJob)
+		if (remoteChecksum) {
+			const cachedChecksum = await this.loadCache(checksumLocalFileUri, checksumCodec)
+			if (remoteChecksum === cachedChecksum) {
+				return await this.getCachedOrDownloadCache(job)
+			} else {
+				this.logger.info(`[Downloader] [${localFileUri}] Checksum mismatch, refreshing cache`)
+				await this.deleteCache(localFileUri)
+				await this.saveCache(checksumLocalFileUri, Buffer.from(remoteChecksum), checksumCodec)
 			}
+		} else {
+			this.logger.info(`[Downloader] [${localFileUri}] Checksum check failed, falling back to cached download`)
 		}
 
+		return await this.getCachedOrDownloadCache(job)
+	}
+
+	async getCachedOrDownloadCache<R>(job: Job<R>): Promise<R | undefined> {
+		const { remoteUri: uri, optionsRemoteUri: optionsUri, localFileUri, codec } = job
+
+		const file = await this.loadCache(localFileUri, codec)
+		if (file) {
+			return file
+		}
+
+		this.logger.info(`[Downloader] [${localFileUri}] Trying to dowload "${uri}"`)
+
 		try {
-			const buffer = await this.lld.get(uri, options)
-			if (cache && cachePath && cacheChecksumPath) {
-				if (checksum) {
-					try {
-						await fileUtil.writeFile(fileUtil.pathToFileUri(cacheChecksumPath), `${checksum}\n`)
-					} catch (e) {
-						this.logger.error(`[Downloader] [${id}] Saving cache checksum “${cacheChecksumPath}”`, e)
-					}
-				}
-				try {
-					const serializer = cache.serializer ?? (b => b)
-					await fileUtil.writeFile(fileUtil.pathToFileUri(cachePath), await serializer(buffer))
-				} catch (e) {
-					this.logger.error(`[Downloader] [${id}] Caching file “${cachePath}”`, e)
-				}
+			const buffer = await this.lld.get(uri, optionsUri)
+			this.logger.info(`[Downloader] [${localFileUri}] Downloaded from "${uri}"`)
+			if (buffer) {
+				this.saveCache(localFileUri, buffer, codec) 
 			}
-			this.logger.info(`[Downloader] [${id}] Downloaded from “${uri}”`)
-			return await transformer(buffer)
+			return await codec.constructor(buffer)
+		} catch (err) {
+			this.logger.error(`[Downloader] [${localFileUri}] Download failed: \n `, err)
+		}
+
+		this.logger.error(`[Downloader] [${localFileUri}] Failed, returning empty`)
+
+		return undefined
+	}
+
+	async dowload<R>(job: Job<R>): Promise<R | undefined> {
+		const { remoteUri: uri, optionsRemoteUri: optionsUri, localFileUri, codec } = job
+
+		this.logger.info(`[Downloader] [${localFileUri}] Trying to dowload "${uri}"`)
+
+		try {
+			const buffer = await this.lld.get(uri, optionsUri)
+			this.logger.info(`[Downloader] [${localFileUri}] Downloaded from "${uri}"`)
+			return await codec.constructor(buffer)
+		} catch (err) {
+			this.logger.error(`[Downloader] [${localFileUri}] Download failed: \n `, err)
+		}
+
+		this.logger.error(`[Downloader] [${localFileUri}] Failed, returning empty`)
+
+		return undefined
+	}
+
+	private async loadCache<R>(localFileUri: string, codec: Codec<R>): Promise<R | undefined> {
+		const cacheFilePath = path.join(this.cacheRoot, localFileUri)
+		try {
+			const cachedBuffer = await fileUtil.readFile(fileUtil.pathToFileUri(cacheFilePath))
+			const deserializer = codec.deserializer ?? (b => b)
+			const ans = await codec.constructor(await deserializer(cachedBuffer))
+			this.logger.info(`[Downloader] [${localFileUri}] Skipped downloading thanks to cache`)
+			return ans
 		} catch (e) {
-			this.logger.error(`[Downloader] [${id}] Downloading “${uri}”`, e)
-			if (cache && cachePath) {
+			if (!isEnoent(e)) {
+				this.logger.error(`[Downloader] [${localFileUri}] Failed to load cache file "${cacheFilePath}": \n `, e)
 				try {
-					const cachedBuffer = await fileUtil.readFile(fileUtil.pathToFileUri(cachePath))
-					const deserializer = cache.deserializer ?? (b => b)
-					const ans = await transformer(await deserializer(cachedBuffer))
-					this.logger.warn(`[Downloader] [${id}] Fell back to cached file “${cachePath}”`)
-					return ans
+					await fsp.unlink(cacheFilePath)
+					this.logger.info(`[Downloader] [${localFileUri}] Removed the invalid cache file`)
 				} catch (e) {
-					this.logger.error(`[Downloader] [${id}] Fallback: loading cached file “${cachePath}”`, e)
+					this.logger.error(`[Downloader] [${localFileUri}] Failed to remove the invalid cache file: \n `, e)
 				}
+			} else {
+				this.logger.error(`[Downloader] [${localFileUri}] Cache file does not exist`)
 			}
 		}
 
 		return undefined
 	}
+	
+	private async saveCache<R>(localFileUri: string, toSave: Buffer, codec: Codec<R>) {
+		const cacheFilePath = path.join(this.cacheRoot, localFileUri)
+		try {
+			const serializer = codec.serializer ?? (b => b)
+			await fileUtil.writeFile(fileUtil.pathToFileUri(cacheFilePath), await serializer(toSave))
+			this.logger.info(`[Downloader] [${localFileUri}] New cached file saved`)
+		} catch (e) {
+			this.logger.error(`[Downloader] [${localFileUri}] Failed to save the cache file "${localFileUri}": \n `, e)
+		}
+	}
+
+	private async deleteCache<R>(localFileUri: string) {
+		const cacheFilePath = path.join(this.cacheRoot, localFileUri)
+		try {
+			await fsp.unlink(cacheFilePath)
+			this.logger.error(`[Downloader] [${localFileUri}] Deleted`)
+		} catch (e) {
+			if (!isEnoent(e)) {
+				this.logger.error(`[Downloader] [${localFileUri}] Failed to delete cache file "${cacheFilePath}": \n `, e)
+			} else {
+				this.logger.error(`[Downloader] [${localFileUri}] Cache file does not exist`)
+			}
+		}
+	}
 }
 
 export interface Job<R> {
+	remoteUri: RemoteUriString,
+	optionsRemoteUri?: LowLevelDownloadOptions,
 	/**
-	 * A unique ID for the cache.
-	 * 
-	 * It also determines where the file is cached. Use slashes (`/`) to create directories.
+	 * A unique ID in a local cache. 
+	 * Unique ID storage path: '~/vscode-worldgen-tools/Cache/@var localFileUri'
 	 */
-	id: string,
-	uri: RemoteUriString,
-	cache?: {
-		/**
-		 * A download {@link Job} that will return a checksum of the latest remote data.
-		 */
-		checksumJob: Omit<Job<string>, 'cache' | 'id'>,
-		checksumExtension: `.${string}`,
-		serializer?: (data: Buffer) => Buffer | Promise<Buffer>,
-		deserializer?: (cache: Buffer) => Buffer | Promise<Buffer>,
-	},
-	transformer: (data: Buffer) => PromiseLike<R> | R,
-	options?: LowLevelDownloadOptions,
+	localFileUri: string,
+	codec: Codec<R>
+}
+export interface Codec<R> {
+	/**
+	 * A serializer for cache files
+	 */
+	serializer?: (data: Buffer) => Buffer | Promise<Buffer>,
+	/**
+	 * A deserializer for cached files
+	 */
+	deserializer?: (cache: Buffer) => Buffer | Promise<Buffer>,
+	/**
+	 * A final transformation for downloaded or cache files
+	 */
+	constructor: (data: Buffer) => PromiseLike<R> | R
 }
 
 interface LowLevelDownloadOptions {
@@ -138,7 +175,11 @@ interface LowLevelDownloadOptions {
 	 * Use an string array to set multiple values to the header.
 	 */
 	headers?: Record<string, string | string[]>
-	timeout?: number,
+    timeout?: number;
+    /**
+     * @default 8192
+     */
+    maxHeaderSize?: number;
 }
 
 export interface LowLevelDownloader {
@@ -160,19 +201,23 @@ export namespace LowLevelDownloader {
 class LowLevelDownloaderImpl implements LowLevelDownloader {
 	get(uri: RemoteUriString, options: LowLevelDownloadOptions = {}): Promise<Buffer> {
 		const protocol = RemoteUriString.getProtocol(uri)
-		return new Promise((resolve, reject) => {
+		
+		return new Promise<Buffer>((resolve, reject) => {
 			const callback = (res: IncomingMessage) => {
-				if (res.statusCode !== 200) {
-					reject(new Error(`Status code ${res.statusCode}: ${res.statusMessage}`))
-				} else {
-					resolve(promisifyAsyncIterable(res, chunks => Buffer.concat(chunks)))
-				}
+			  	let data = ''
+				res.on('data', (chunk) => {
+			    	data += chunk
+			  	})
+			  	res.on('end', () => {
+					resolve(Buffer.from(data))
+			  	})
 			}
-			if (protocol === 'http:') {
-				http.get(uri, options, callback)
-			} else {
-				https.get(uri, options, callback)
-			}
+
+			const req = protocol === 'http:' ? http.get(uri, options, callback) : https.get(uri, options, callback)
+
+			req.on('error' , (err: Error) => {
+				reject(err);
+			})
 		})
 	}
 }

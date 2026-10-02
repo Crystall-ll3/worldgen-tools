@@ -13,8 +13,8 @@ import { getNonce } from './util'
 
 const deepClone = rfdc()
 
-const MCMETA = 'https://raw.githubusercontent.com/misode/mcmeta'
-const VERSION = '1.19.2'
+const REPO_MCMETA = 'https://raw.githubusercontent.com/misode/mcmeta'
+const VERSION = '1.19'
 
 interface ViewType {
 	key: string
@@ -46,7 +46,7 @@ export class ViewProvider implements vscode.WebviewPanelSerializer {
 		},
 	]
 	private readonly downloader: Downloader
-	private vanilla: undefined | Record<string, Record<string, string>>
+	private loadedVanillaData: undefined | Record<string, Record<string, string>>
 
 	constructor(
 		private readonly context: vscode.ExtensionContext,
@@ -94,7 +94,7 @@ export class ViewProvider implements vscode.WebviewPanelSerializer {
 				enableScripts: true,
 			}
 
-			const data = await this.getVanillaData()
+			const data = await this.getVanillaData(VERSION)
 
 			const pack = await findUp('pack.mcmeta', { cwd: fileUri.fsPath })
 			let fileResource: string | undefined
@@ -177,23 +177,31 @@ export class ViewProvider implements vscode.WebviewPanelSerializer {
 			</html>`
 	}
 
-	private async getVanillaData() {
-		if (this.vanilla !== undefined) return deepClone(this.vanilla)
+	private async getVanillaData(version: string) {
+		if (this.loadedVanillaData !== undefined) return deepClone(this.loadedVanillaData)
 
+		return this.updateVanillaData(version)
+	}
+
+	private async updateVanillaData(version: string) {
 		const vanillaData = await Promise.all(ViewProvider.TYPES
 			.filter(({ fetch }) => fetch)
-			.map(async({ key }) => {
-				const data = await this.downloader.download({
-					id: `mc-je/${VERSION}/${key}.json.gz`,
-					uri: `${MCMETA}/${VERSION}-summary/data/${key}/data.min.json`,
-					transformer: (buffer) => JSON.parse(buffer.toString('utf-8')) as Promise<Record<string, string>>,
-					cache: {
-						checksumExtension: '.cache',
-						checksumJob: {
-							uri: `${MCMETA}/${VERSION}-summary/version.txt`,
-							transformer: data => data.toString('utf-8'),
-						},
+			.map(async ({ key }) => {
+				const data = await this.downloader.getCacheOrRefreshDownload({
+					remoteUri: `${REPO_MCMETA}/${version}-summary/data/${key}/data.min.json`,
+					optionsRemoteUri: {
+						timeout: 10000
 					},
+					localFileUri: `mc-je/${version}/${key}.json.gz`,
+					codec: {
+						constructor: (buffer) => JSON.parse(buffer.toString('utf-8')) as Promise<Record<string, string>>,
+					}
+				}, {
+					remoteUri: `${REPO_MCMETA}/${VERSION}-summary/version.txt`,
+					localFileUri: `mc-je/${version}/${key}.json.gz.cache`,
+					codec: {
+						constructor: (buffer) => buffer.toString('utf-8'),
+					}
 				})
 				if (!data) {
 					this.logger.error(`[ViewProvider] Failed to fetch data for '${key}'`)
@@ -205,10 +213,10 @@ export class ViewProvider implements vscode.WebviewPanelSerializer {
 			})
 		)
 
-		this.vanilla = Object.fromEntries(ViewProvider.TYPES.map((type, i) => {
+		this.loadedVanillaData = Object.fromEntries(ViewProvider.TYPES.map((type, i) => {
 			return [type.key, vanillaData[i]]
 		}))
 
-		return deepClone(this.vanilla)
+		return deepClone(this.loadedVanillaData)
 	}
 }

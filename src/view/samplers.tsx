@@ -1,4 +1,4 @@
-import { BiomeSource, clampedMap, computeIfAbsent, DensityFunction, Identifier, Json, NoiseChunkGenerator, NoiseGeneratorSettings, NoiseParameters, NoiseRouter, NormalNoise, RandomState, WorldgenRegistries, XoroshiroRandom } from 'deepslate'
+import { BiomeSource, clampedMap, DensityFunction, Identifier, Json, NoiseChunkGenerator, NoiseGeneratorSettings, NoiseParameters, NoiseRouter, NormalNoise, RandomState, WorldgenRegistries, XoroshiroRandom } from 'deepslate'
 import type { JSX } from 'preact'
 import { h } from 'preact'
 import type { Color } from './colormap'
@@ -23,7 +23,7 @@ export class EmptySampler implements Sampler {
 }
 
 export abstract class CacheableSampler<D> implements Sampler {
-	private readonly cache = new Map<string, D>()
+	private readonly cache = new Map<number, Map<number, D>>()
 
 	protected abstract sample(x: number, y: number): D
 	protected abstract asColor(d: D): Color
@@ -35,9 +35,17 @@ export abstract class CacheableSampler<D> implements Sampler {
 
 	private cachedSample(x: number, y: number) {
 		const { x: xx, y: yy } = this.translate(x, y)
-		return computeIfAbsent(this.cache, `${xx} ${yy}`, () => {
-			return this.sample(xx, yy)
-		})
+		let map = this.cache.get(xx)
+		if (map === undefined) {
+			map = new Map<number, D>()
+			this.cache.set(xx, map)
+		}
+		let value = map.get(yy)
+		if (value === undefined) {
+			value = this.sample(xx, yy)
+			map.set(yy, value)
+		}
+		return value
 	}
 
 	public sampleColor(x: number, y: number) {
